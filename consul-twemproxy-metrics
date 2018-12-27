@@ -1,0 +1,136 @@
+#!/usr/bin/env python
+import json
+import io
+import os
+import socket
+from collections import namedtuple
+from datetime import datetime
+from typing import List, Mapping
+
+import consulate
+import influxdb
+import pytz
+
+
+CONSUL_HOST = os.environ.get('CONSUL_HOST', os.environ.get('HOST', 'localhost'))
+TWEMPROXY_STATS_PORT = os.environ.get('TWEMPROXY_STATS_PORT', '22222')
+
+INFLUXDB_RETENTION_DURATION = os.environ.get('INFLUXDB_RETENTION_DURATION', '7d')
+INFLUXDB_RETENTION_REPLICATION = int(os.environ.get('INFLUXDB_RETENTION_REPLICATION', '1'))
+INFLUXDB_TIME_PRECISION = os.environ.get('INFLUXDB_TIME_PRECISION', 'm')
+INFLUXDB_PREFIX = os.environ.get('INFLUXDB_PREFIX', 'twemproxy')
+
+
+ServerInfo = namedtuple('ServerInfo', 'address port id node')
+
+
+def get_service_instances(service_name: str) -> List[ServerInfo]:
+    consul = consulate.Consul(CONSUL_HOST)
+    service = consul.catalog.service(service_name)
+    return [
+        ServerInfo(i['ServiceAddress'], i['ServicePort'], i['ServiceID'], i['Node'])
+        for i in service
+    ]
+
+
+def collect_twemproxy_stats(host, port=int(TWEMPROXY_STATS_PORT)):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.connect((host, port))
+        with io.BytesIO() as stream:
+            while 1:
+                data = sock.recv(1024)
+                if data == b'':
+                    break
+                stream.write(data)
+            stream.seek(0)
+            return json.load(stream)
+
+
+def get_metrics_for_server(server_info: ServerInfo) -> List[dict]:
+    twemproxy_data = collect_twemproxy_stats(server_info.address)
+    redis_stats = twemproxy_data.get('redis', {})
+
+    server_data = {
+        'curr_connections': twemproxy_data['curr_connections'],
+        'total_connections': twemproxy_data['total_connections'],
+        'uptime': twemproxy_data['uptime'],
+        'client_connections': redis_stats.pop('client_connections', None),
+        'client_eof': redis_stats.pop('client_eof', None),
+        'client_err': redis_stats.pop('client_err', None),
+        'forward_error': redis_stats.pop('forward_error', None),
+        'fragments': redis_stats.pop('fragments', None),
+        'server_ejects': redis_stats.pop('server_ejects', None),
+    }
+
+    timestamp = datetime.utcnow().replace(tzinfo=pytz.utc)
+    metrics = format_influx_data(server_data, timestamp)
+
+    for instance, stats in redis_stats.items():
+        metrics.extend(format_influx_data(stats, timestamp, tags={'instance': instance}))
+
+    return metrics
+
+
+def get_server_tags(service_name: str, server_info: ServerInfo) -> dict:
+    return {
+        'service': service_name,
+        'id': server_info.id,
+        'node': server_info.node,
+    }
+
+
+def format_influx_data(metrics: Mapping[str, int], timestamp: datetime = None,
+                       tags: dict = None) -> List[dict]:
+    points = []
+    timestamp = timestamp or datetime.utcnow().replace(tzinfo=pytz.utc)
+    for key, value in metrics.items():
+        points.append({
+            'measurement': f'{INFLUXDB_PREFIX}.{key}',
+            'tags': tags or {},
+            'time': timestamp,
+            'fields': {'value': value}
+        })
+    return points
+
+
+def get_influx_client(influx_dsn: str) -> influxdb.InfluxDBClient:
+    client = influxdb.InfluxDBClient.from_dsn(influx_dsn)
+    db_name = client._database
+    if db_name:
+        existing_dbs = client.get_list_database()
+        for db in existing_dbs:
+            if db['name'] == db_name:
+                break
+        else:
+            client.create_database(db_name)
+            client.create_retention_policy(f'{db_name}_policy',
+                                           INFLUXDB_RETENTION_DURATION,
+                                           INFLUXDB_RETENTION_REPLICATION,
+                                           default=True)
+    return client
+
+
+def main(influx_dsn, *service_names):
+    influx = get_influx_client(influx_dsn)
+
+    for service_name in service_names:
+        twemproxy_servers = get_service_instances(service_name)
+        if not twemproxy_servers:
+            print(f'No instances for consul service "{service_name}"')
+            continue
+
+        for server_info in twemproxy_servers:
+            metrics = get_metrics_for_server(server_info)
+            print(f'Writing {len(metrics)} points for: {server_info.id}')
+            tags = get_server_tags(service_name, server_info)
+            influx.write_points(metrics, tags=tags, time_precision=INFLUXDB_TIME_PRECISION)
+
+
+if __name__ == '__main__':
+    import sys
+
+    if len(sys.argv) < 3:
+        print(f'Usage: {sys.argv[0]} INFLUX_DSN SERVICE_NAME [SERVICE_NAME ...]')
+        sys.exit(1)
+
+    main(*sys.argv[1:])
